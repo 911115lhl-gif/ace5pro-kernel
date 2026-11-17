@@ -1,0 +1,744 @@
+name: ace5pro-b16-sukisu-susfs-kpm
+
+# Builds a GKI kernel with SukiSU Ultra + SUSFS + KPM for the OnePlus Ace 5 Pro
+# (PKR110 / sun / sm8750 / 4K pages / Android 16 / 6.6.118).
+#
+# The layout follows the known-working flow used by giang/OnePlus-Suki-Ultra-SUSFS-Actions:
+# the KernelSU integration and the SUSFS patches all go into kernel_platform/common
+# (the real GKI kernel tree), NOT into msm-kernel (the vendor tree). Building
+# msm-kernel produced images that could not boot even with KernelSU disabled, because
+# msm-kernel is not the GKI kernel the bootloader expects.
+#
+# Final kernel also gets the SuKiSU KernelPatch binary pass (kptools patch_linux),
+# which is what injects the hook table the manager talks to.
+
+on:
+  workflow_dispatch:
+    inputs:
+      CPU:
+        description: "platform (only sm8750)"
+        required: true
+        default: "sm8750"
+        type: choice
+        options:
+          - sm8750
+      FEIL:
+        description: "manifest target (only oneplus_ace5_pro_b)"
+        required: true
+        default: "oneplus_ace5_pro_b"
+        type: choice
+        options:
+          - oneplus_ace5_pro_b
+      ENABLE_KPM:
+        description: "enable KPM"
+        required: true
+        default: true
+        type: boolean
+      ENABLE_SUSFS:
+        description: "enable SUSFS"
+        required: true
+        default: true
+        type: boolean
+      ENABLE_HMBIRD_FIX:
+        description: "apply HMBIRD OGKI->GKI DT fix (required to boot on Ace 5 Pro)"
+        required: true
+        default: true
+        type: boolean
+      ENABLE_KERNEL_PATCH:
+        description: "run the SukiSU KernelPatch binary pass on the built Image"
+        required: true
+        default: true
+        type: boolean
+      KERNEL_LOCALVERSION:
+        description: "CONFIG_LOCALVERSION: the WHOLE stock suffix after 6.6.118"
+        required: true
+        default: "-android15-8-g93e223c276e7-abogki500782043-4k"
+      DRY_RUN:
+        description: "stop before compiling (patch/wiring checks only)"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: ace5pro-b16-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MANIFEST: oneplus_ace5_pro_b.xml
+  MANIFEST_BRANCH: oneplus/sm8750
+  ANDROID_VERSION: android15
+  KVERSION: "6.6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: guard_params
+        run: |
+          echo "target=${{ inputs.FEIL }} cpu=${{ inputs.CPU }}"
+          echo "KPM=${{ inputs.ENABLE_KPM }} SUSFS=${{ inputs.ENABLE_SUSFS }}"
+          echo "HMBIRD=${{ inputs.ENABLE_HMBIRD_FIX }} KERNELPATCH=${{ inputs.ENABLE_KERNEL_PATCH }}"
+          echo "LOCALVERSION=${{ inputs.KERNEL_LOCALVERSION }}"
+          short=$(echo "${GITHUB_SHA}" | cut -c1-8)
+          echo "SHORT_SHA=$short" >> "$GITHUB_ENV"
+          echo "BUILDDATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
+
+      - name: install_repo
+        run: |
+          git config --global user.name  "ace5pro-ci"
+          git config --global user.email "ace5pro-ci@users.noreply.github.com"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl git make python3 zip unzip \
+            device-tree-compiler bc bison flex libssl-dev libelf-dev ccache || true
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
+          chmod a+x /tmp/repo
+          sudo mv /tmp/repo /usr/local/bin/repo
+          repo --version | head -2 || true
+
+      - name: free_disk_space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo apt-get clean || true
+          docker system prune -af 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: repo_sync
+        run: |
+          mkdir -p workspace && cd workspace
+          ok=0
+          for i in 1 2 3; do
+            echo "repo init/sync attempt $i"
+            if repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+                 -b "$MANIFEST_BRANCH" -m "$MANIFEST" \
+                 --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags \
+               && repo sync -c -j"$(nproc)" --no-clone-bundle --no-tags --force-sync --fail-fast; then
+              ok=1; break
+            fi
+            sleep 5
+          done
+          test "$ok" = "1" || { echo "ERROR: repo sync failed"; exit 1; }
+          df -h / | tail -1
+          grep -q "SUBLEVEL = 118" kernel_platform/common/Makefile \
+            || { echo "ERROR: common is not 6.6.118"; exit 1; }
+          echo "common tree is 6.6.118 ok"
+          # strip the protected-exports list exactly like the reference flow does
+          for dir in kernel_platform/common kernel_platform/msm-kernel; do
+            if [ -e "$dir/BUILD.bazel" ]; then
+              sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' "$dir/BUILD.bazel"
+            fi
+            rm -f "$dir/android/abi_gki_protected_exports_"* 2>/dev/null || true
+          done
+
+      - name: setup_sukisu
+        run: |
+          cd workspace/kernel_platform
+          # SukiSU-Ultra has been unmaintained and no longer compiles; the proven
+          # sm8750 flow (cctv18) redirects the "sukisu" choice to BakaSU, which is
+          # compatible with the SukiSU manager. BakaSU's kernel/Kconfig declares both
+          # CONFIG_KSU and CONFIG_KSU_SUSFS (plus the SUSFS sub-options), same layout
+          # as SukiSU-Ultra, so the wiring below is unchanged.
+          BR="main"
+          echo "BakaSU branch: $BR"
+          rm -rf KernelSU
+          git clone --depth=1 -b "$BR" https://github.com/Baka-SU/BakaSU.git KernelSU \
+            || { echo "ERROR: clone BakaSU $BR failed"; exit 1; }
+          echo "--- branch actually checked out ---"
+          git -C KernelSU rev-parse --abbrev-ref HEAD || true
+          git -C KernelSU log --oneline -1 || true
+
+          DRIVER_DIR="common/drivers"
+          test -d "$DRIVER_DIR" || { echo "ERROR: $DRIVER_DIR not found"; ls -d */drivers 2>/dev/null; exit 1; }
+          echo "=== installing into $DRIVER_DIR (the GKI tree) ==="
+          rm -f "$DRIVER_DIR/kernelsu"
+          # The symlink lives in common/drivers, so "../KernelSU/kernel" would resolve to
+          # common/KernelSU/kernel, which does not exist. Compute the relative path
+          # instead of hand-writing it (this is what setup.sh does too).
+          KSU_ABS=$(cd KernelSU/kernel && pwd -P)
+          REL=$(realpath --relative-to="$(cd "$DRIVER_DIR" && pwd -P)" "$KSU_ABS")
+          echo "target: $KSU_ABS"
+          echo "relative from $DRIVER_DIR: $REL"
+          ln -sfn "$REL" "$DRIVER_DIR/kernelsu"
+          ls -la "$DRIVER_DIR/kernelsu"
+          KSUDIR="$DRIVER_DIR/kernelsu"
+          test -f "$KSUDIR/Kconfig" || {
+            echo "ERROR: $KSUDIR/Kconfig not reachable"
+            echo "link target resolves to: $(readlink -f "$DRIVER_DIR/kernelsu" 2>/dev/null || echo '<broken>')"
+            ls "$KSU_ABS" | head
+            exit 1
+          }
+          echo "KSUDIR=$KSUDIR" >> "$GITHUB_ENV"
+
+          echo "--- Kconfig symbols ---"
+          grep -n '^config KSU$'     "$KSUDIR/Kconfig" || { echo "ERROR: no KSU"; exit 1; }
+          grep -n '^config KPM$'     "$KSUDIR/Kconfig" || true
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            grep -n '^config KSU_SUSFS$' "$KSUDIR/Kconfig" \
+              || { echo "ERROR: branch $BR has no KSU_SUSFS in Kconfig"; ls "$KSUDIR" | head; exit 1; }
+            echo "  KSU_SUSFS is declared"
+          fi
+
+          echo "--- wire into the build ---"
+          grep -q 'obj-$(CONFIG_KSU)' "$DRIVER_DIR/Makefile" \
+            || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVER_DIR/Makefile"
+          # Insert the source line immediately before the FIRST top-level "endmenu".
+          # awk is used because "sed 0,/re/" is GNU-only and the naive s/// would rewrite
+          # every endmenu in the file.
+          if ! grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig"; then
+            awk 'BEGIN{done=0} { if (!done && $0=="endmenu") { print "source \"drivers/kernelsu/Kconfig\""; done=1 } print }' \
+              "$DRIVER_DIR/Kconfig" > "$DRIVER_DIR/Kconfig.new" \
+              && mv "$DRIVER_DIR/Kconfig.new" "$DRIVER_DIR/Kconfig"
+          fi
+          tail -3 "$DRIVER_DIR/Makefile"
+          grep -n 'kernelsu/Kconfig' "$DRIVER_DIR/Kconfig" || {
+            echo "ERROR: Kconfig not wired"; tail -10 "$DRIVER_DIR/Kconfig"; exit 1; }
+
+          # BakaSU version = main commit count + 30700 (same offset the proven
+          # cctv18 sm8750 flow uses). This is a --depth=1 clone, so count from the
+          # GitHub API instead of `git rev-list --count main` (always 1 here).
+          KSU_COMMITS=$(curl -sI "https://api.github.com/repos/Baka-SU/BakaSU/commits?sha=main&per_page=1" \
+            | grep -i '^link:' | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p' | tr -d '\r')
+          if [ -n "$KSU_COMMITS" ]; then
+            KSU_VERSION=$(expr "$KSU_COMMITS" + 30700)
+          else
+            KSU_VERSION=33700
+          fi
+          echo "main commit count = ${KSU_COMMITS:-unknown}"
+          echo "KSU_VERSION=$KSU_VERSION  (the manager APK must be >= this)"
+          echo "KSU_VERSION=$KSU_VERSION" >> "$GITHUB_ENV"
+
+      - name: setup_susfs
+        if: ${{ inputs.ENABLE_SUSFS == true }}
+        run: |
+          cd workspace
+          # Use cctv18/susfs4oki (the OPLUS/OKI-adapted fork of susfs4ksu), NOT the
+          # upstream simonpunk/susfs4ksu gki branch. On OPLUS's modified kernel tree the
+          # upstream patch does not apply cleanly / produced unbootable images; the
+          # "oki-" fork is what the proven sm8750 flow uses.
+          git clone --depth=1 -b "oki-${ANDROID_VERSION}-${KVERSION}" \
+            https://github.com/cctv18/susfs4oki.git susfs4ksu || {
+              echo "ERROR: clone susfs4oki failed"; exit 1; }
+          git clone --depth=1 https://github.com/SukiSU-Ultra/SukiSU_patch.git \
+            || { echo "ERROR: clone SukiSU_patch failed"; exit 1; }
+          test -f "susfs4ksu/kernel_patches/50_add_susfs_in_gki-${ANDROID_VERSION}-${KVERSION}.patch" \
+            || { echo "ERROR: 50_add_susfs patch missing"; ls susfs4ksu/kernel_patches; exit 1; }
+
+          echo "=== copy susfs sources into the GKI tree (common/) ==="
+          cp -v susfs4ksu/kernel_patches/fs/*              kernel_platform/common/fs/
+          cp -v susfs4ksu/kernel_patches/include/linux/*   kernel_platform/common/include/linux/
+          cp -v "susfs4ksu/kernel_patches/50_add_susfs_in_gki-${ANDROID_VERSION}-${KVERSION}.patch" kernel_platform/common/
+          cp -v SukiSU_patch/69_hide_stuff.patch           kernel_platform/common/
+          test -f kernel_platform/common/fs/susfs.c \
+            || { echo "ERROR: susfs.c not copied"; exit 1; }
+
+          cd kernel_platform/common
+          P50="50_add_susfs_in_gki-${ANDROID_VERSION}-${KVERSION}.patch"
+
+          # Apply the patch exactly as shipped. An earlier attempt tried to delete the
+          # "#include <trace/hooks/fs.h>" context line (copied from a different device's
+          # flow), but this tree DOES have include/trace/hooks/fs.h, and dropping a
+          # context line desynchronises the hunk counts so patch aborts with
+          #   "malformed patch at line 662"
+          # So: verify the header really exists, then leave the patch untouched.
+          echo "=== sanity check: does this tree provide trace/hooks/fs.h? ==="
+          test -f include/trace/hooks/fs.h \
+            && echo "  include/trace/hooks/fs.h present -> patch needs no edit" \
+            || echo "  WARN: include/trace/hooks/fs.h missing; patch may fail at fs/namespace.c"
+
+          echo "=== apply 69_hide_stuff.patch ==="
+          patch -p1 -F 3 < 69_hide_stuff.patch || { echo "ERROR: 69_hide_stuff failed"; exit 1; }
+
+          echo "=== apply 50_add_susfs_in_kernel ==="
+          # dry-run first so a half-applied patch cannot leave the tree dirty
+          if ! patch -p1 --dry-run -F 3 < "$P50" > /tmp/p50_dry.log 2>&1; then
+            echo "ERROR: 50_add_susfs dry-run failed"
+            tail -30 /tmp/p50_dry.log
+            exit 1
+          fi
+          echo "  dry-run ok"
+          patch -p1 -F 3 < "$P50" || {
+            echo "ERROR: 50_add_susfs failed on the real apply"
+            find . -name '*.rej' -exec sh -c 'echo "### $1"; cat "$1"' _ {} \; 2>/dev/null | head -60
+            exit 1
+          }
+          echo "  50_add_susfs applied cleanly"
+
+          echo "=== apply manual hooks ==="
+          cp -v ../../SukiSU_patch/hooks/scope_min_manual_hooks_v1.6.patch ./
+          if ! patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch; then
+            echo "WARN: manual hooks patch had rejects (kprobe hooking will be used instead)"
+            find . -name '*.rej' 2>/dev/null | head -10
+          else
+            echo "  manual hooks applied cleanly"
+          fi
+
+          echo "=== verify wiring ==="
+          grep -q "susfs" fs/namei.c      || { echo "ERROR: fs/namei.c has no susfs hook"; exit 1; }
+          grep -q "susfs" fs/namespace.c  || { echo "ERROR: fs/namespace.c has no susfs hook"; exit 1; }
+          grep -qE "CONFIG_KSU_SUSFS" fs/Makefile \
+            || { echo "ERROR: fs/Makefile lacks the susfs.o rule"; exit 1; }
+          test -f include/linux/susfs.h     || { echo "ERROR: include/linux/susfs.h missing"; exit 1; }
+          test -f include/linux/susfs_def.h || { echo "ERROR: include/linux/susfs_def.h missing"; exit 1; }
+          echo "  OK: namei.c / namespace.c / fs/Makefile / headers wired"
+          echo "susfs integrated ok"
+
+      - name: write_kernel_config
+        run: |
+          cd workspace/kernel_platform
+          CFG=./common/arch/arm64/configs/gki_defconfig
+          test -f "$CFG" || { echo "ERROR: $CFG not found"; exit 1; }
+          echo "--- original tail ---"
+          tail -5 "$CFG"
+          echo "" >> "$CFG"
+          echo "# ==== injected by ace5pro workflow ====" >> "$CFG"
+          echo "CONFIG_KSU=y" >> "$CFG"
+          if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
+            echo "CONFIG_KPM=y" >> "$CFG"
+          fi
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CFG"
+            echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$CFG"
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CFG"
+          fi
+          # Match the stock build's LTO mode. sakfi/OP_KSUN_FS configs/a16/
+          # OP-ACE-5-PRO.json sets "lto": "thin" for this exact device, and the stock
+          # kernel is a thinlto build. Full LTO would change codegen substantially.
+          for lto in CONFIG_LTO CONFIG_LTO_CLANG CONFIG_LTO_CLANG_THIN CONFIG_LTO_CLANG_FULL CONFIG_LTO_NONE; do
+            sed -i "/^$lto[= ]/d" "$CFG"
+          done
+          {
+            echo "CONFIG_LTO=y"
+            echo "CONFIG_LTO_CLANG=y"
+            echo "CONFIG_LTO_CLANG_THIN=y"
+            echo "# CONFIG_LTO_CLANG_FULL is not set"
+            echo "# CONFIG_LTO_NONE is not set"
+          } >> "$CFG"
+          echo "--- LTO lines ---"
+          grep -n '^CONFIG_LTO' "$CFG" || true
+          # The release string must stay byte-identical to stock or the untouched
+          # vendor_dlkm modules refuse to load (vermagic mismatch).
+          # gki_defconfig ships CONFIG_LOCALVERSION="-4k"; rewrite ONLY that exact
+          # assignment so nothing else containing "-4k" is touched.
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> "$CFG"
+          STOCK="${{ inputs.KERNEL_LOCALVERSION }}"
+          if grep -qE '^CONFIG_LOCALVERSION=' "$CFG"; then
+            # delete every existing assignment, then append exactly one
+            sed -i '/^CONFIG_LOCALVERSION=/d' "$CFG"
+          fi
+          printf 'CONFIG_LOCALVERSION="%s"\n' "$STOCK" >> "$CFG"
+          echo "--- CONFIG_LOCALVERSION lines ---"
+          grep -n '^CONFIG_LOCALVERSION' "$CFG"
+          # check_defconfig rejects any change to the shipped defconfig; drop it
+          sudo sed -i 's/check_defconfig//' ./common/build.config.gki
+          echo "--- resulting tail ---"
+          tail -25 "$CFG"
+
+      - name: apply_hmbird_fix
+        if: ${{ inputs.ENABLE_HMBIRD_FIX == true }}
+        run: |
+          # The Ace 5 Pro device tree advertises HMBIRD_OGKI; a GKI kernel built here
+          # only accepts HMBIRD_GKI. Without this early_initcall the kernel gives up
+          # very early and the device reboots (logo shown, then black).
+          cd workspace/kernel_platform/common/drivers
+          # single-line base64 decoded with a pipe: no heredoc, no indentation
+          # characters to strip, so the YAML indentation cannot corrupt it
+          echo 'I2luY2x1ZGUgPGxpbnV4L2luaXQuaD4KI2luY2x1ZGUgPGxpbnV4L21vZHVsZS5oPgojaW5jbHVkZSA8bGludXgvb2YuaD4KI2luY2x1ZGUgPGxpbnV4L3NsYWIuaD4KI2luY2x1ZGUgPGxpbnV4L3N0cmluZy5oPgoKc3RhdGljIGludCBfX2luaXQgaG1iaXJkX3BhdGNoX2luaXQodm9pZCkKewogICAgc3RydWN0IGRldmljZV9ub2RlICp2ZXJfbnA7CiAgICBjb25zdCBjaGFyICp0eXBlOwogICAgc3RydWN0IHByb3BlcnR5ICpwcm9wLCAqbmV3X3Byb3A7CiAgICBpbnQgcmV0OwoKICAgIHZlcl9ucCA9IG9mX2ZpbmRfbm9kZV9ieV9wYXRoKCIvc29jL29wbHVzLGhtYmlyZC92ZXJzaW9uX3R5cGUiKTsKICAgIGlmICghdmVyX25wKSB7CiAgICAgICAgcHJfaW5mbygiaG1iaXJkX3BhdGNoOiB2ZXJzaW9uX3R5cGUgbm9kZSBub3QgZm91bmRcbiIpOwogICAgICAgIHJldHVybiAwOwogICAgfQogICAgcmV0ID0gb2ZfcHJvcGVydHlfcmVhZF9zdHJpbmcodmVyX25wLCAidHlwZSIsICZ0eXBlKTsKICAgIGlmIChyZXQpIHsKICAgICAgICBwcl9pbmZvKCJobWJpcmRfcGF0Y2g6IHR5cGUgcHJvcGVydHkgbm90IGZvdW5kXG4iKTsKICAgICAgICBvZl9ub2RlX3B1dCh2ZXJfbnApOwogICAgICAgIHJldHVybiAwOwogICAgfQogICAgaWYgKHN0cmNtcCh0eXBlLCAiSE1CSVJEX09HS0kiKSkgewogICAgICAgIG9mX25vZGVfcHV0KHZlcl9ucCk7CiAgICAgICAgcmV0dXJuIDA7CiAgICB9CiAgICBwcm9wID0gb2ZfZmluZF9wcm9wZXJ0eSh2ZXJfbnAsICJ0eXBlIiwgTlVMTCk7CiAgICBpZiAocHJvcCkgewogICAgICAgIG5ld19wcm9wID0ga21hbGxvYyhzaXplb2YoKm5ld19wcm9wKSwgR0ZQX0tFUk5FTCk7CiAgICAgICAgaWYgKCFuZXdfcHJvcCkgewogICAgICAgICAgICBvZl9ub2RlX3B1dCh2ZXJfbnApOwogICAgICAgICAgICByZXR1cm4gMDsKICAgICAgICB9CiAgICAgICAgbWVtY3B5KG5ld19wcm9wLCBwcm9wLCBzaXplb2YoKnByb3ApKTsKICAgICAgICBuZXdfcHJvcC0+dmFsdWUgPSBrbWFsbG9jKHN0cmxlbigiSE1CSVJEX0dLSSIpICsgMSwgR0ZQX0tFUk5FTCk7CiAgICAgICAgaWYgKCFuZXdfcHJvcC0+dmFsdWUpIHsKICAgICAgICAgICAga2ZyZWUobmV3X3Byb3ApOwogICAgICAgICAgICBvZl9ub2RlX3B1dCh2ZXJfbnApOwogICAgICAgICAgICByZXR1cm4gMDsKICAgICAgICB9CiAgICAgICAgc3RyY3B5KG5ld19wcm9wLT52YWx1ZSwgIkhNQklSRF9HS0kiKTsKICAgICAgICBuZXdfcHJvcC0+bGVuZ3RoID0gc3RybGVuKCJITUJJUkRfR0tJIikgKyAxOwogICAgICAgIGlmIChvZl9yZW1vdmVfcHJvcGVydHkodmVyX25wLCBwcm9wKSAhPSAwKSB7CiAgICAgICAgICAgIG9mX25vZGVfcHV0KHZlcl9ucCk7CiAgICAgICAgICAgIHJldHVybiAwOwogICAgICAgIH0KICAgICAgICBpZiAob2ZfYWRkX3Byb3BlcnR5KHZlcl9ucCwgbmV3X3Byb3ApICE9IDApIHsKICAgICAgICAgICAgb2Zfbm9kZV9wdXQodmVyX25wKTsKICAgICAgICAgICAgcmV0dXJuIDA7CiAgICAgICAgfQogICAgICAgIHByX2luZm8oImhtYmlyZF9wYXRjaDogSE1CSVJEX09HS0kgLT4gSE1CSVJEX0dLSSBva1xuIik7CiAgICB9CiAgICBvZl9ub2RlX3B1dCh2ZXJfbnApOwogICAgcmV0dXJuIDA7Cn0KZWFybHlfaW5pdGNhbGwoaG1iaXJkX3BhdGNoX2luaXQpOwpNT0RVTEVfTElDRU5TRSgiR1BMIik7Ck1PRFVMRV9ERVNDUklQVElPTigiRm9yY2VmdWxseSBjb252ZXJ0IEhNQklSRF9PR0tJIHRvIEhNQklSRF9HS0kuIik7' | base64 -d > hmbird_patch.c
+          test -s hmbird_patch.c || { echo 'ERROR: hmbird_patch.c empty'; exit 1; }
+          head -3 hmbird_patch.c
+          # build it unconditionally. printf (not echo) so a Makefile whose last line
+          # lacks a trailing newline cannot glue the new rule onto that line.
+          if ! grep -q '^obj-y += hmbird_patch\.o' Makefile; then
+            printf '\nobj-y += hmbird_patch.o\n' >> Makefile
+          fi
+          echo "--- Makefile tail ---"
+          tail -3 Makefile
+          grep -q '^obj-y += hmbird_patch\.o' Makefile || { echo 'ERROR: Makefile not updated'; exit 1; }
+          echo "hmbird_patch.c installed"
+
+      - name: set_release_string
+        run: |
+          # scripts/setlocalversion ends with a line that concatenates
+          #   ${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}
+          # and the stock banner carries no scm tail, so ${scm_version} has to go from
+          # THAT line only. The scm_version() helper and its other call sites must stay,
+          # so all checks below look at the last "echo ${KERNELVERSION}" line alone.
+          KDIR="workspace/kernel_platform/common"
+          SL="$KDIR/scripts/setlocalversion"
+          test -f "$SL" || { echo "ERROR: $SL missing"; exit 1; }
+
+          echo "--- all echo KERNELVERSION lines (before) ---"
+          grep -n 'echo "${KERNELVERSION}' "$SL" || { echo "ERROR: no echo KERNELVERSION"; exit 1; }
+
+          # the release line is the LAST such line; take its number
+          FINAL_LINE=$(grep -n 'echo "${KERNELVERSION}' "$SL" | tail -1 | cut -d: -f1)
+          echo "final release line = $FINAL_LINE"
+          test -n "$FINAL_LINE" || { echo "ERROR: could not locate the final echo"; exit 1; }
+          echo "before: $(sed -n "${FINAL_LINE}p" "$SL")"
+
+          # drop only the ${scm_version} expansion, and only on that line
+          sed -i "${FINAL_LINE}s/\\\${scm_version}//g" "$SL"
+          echo "after : $(sed -n "${FINAL_LINE}p" "$SL")"
+
+          # verify against that single line, not the whole file
+          if sed -n "${FINAL_LINE}p" "$SL" | grep -q 'scm_version'; then
+            echo "ERROR: scm_version still expanded on the final release line"
+            exit 1
+          fi
+          # and make sure we did not damage the helper definition
+          grep -q '^scm_version()' "$SL" || { echo "ERROR: scm_version() helper lost"; exit 1; }
+          echo "final release line is clean, scm_version() helper intact"
+
+          echo "--- CONFIG_LOCALVERSION in defconfig ---"
+          grep -n "CONFIG_LOCALVERSION" "$KDIR/arch/arm64/configs/gki_defconfig" || true
+
+      - name: build_kernel
+        if: ${{ !inputs.DRY_RUN }}
+        run: |
+          cd workspace/kernel_platform
+          # The stock kernel on this device was built with the AOSP clang that
+          # ships inside kernel_platform: clang-r510928 (clang 18.0.0), llvm-project
+          # commit 477610d4d0d988e69dbc3fae4fe86bff3f07f2b5.
+          #
+          # Verified directly out of the stock boot image (boot_b == the image in
+          # phone_download_backup/boot_stock.img):
+          #   Linux version 6.6.118-android15-8-g93e223c276e7-abogki500782043-4k
+          #   (kleaf@build-host) (Android (11368308, +pgo, +bolt, +lto, +mlgo,
+          #   based on r510928) clang version 18.0.0 (...477610d4...), LLD 18.0.0)
+          #   #1 SMP PREEMPT Wed Apr  8 15:08:30 UTC 2026
+          #
+          # The "ZyC clang 19" banner belongs to a SELF-BUILT image, not to stock.
+          # Earlier runs picked ZyC because clang-18 images failed to boot, but the
+          # cause of those failures was elsewhere (config / HMBIRD / SUSFS patch),
+          # not the toolchain.
+          CLANG_DIR="$PWD/prebuilts/clang/host/linux-x86/clang-r510928"
+          test -x "$CLANG_DIR/bin/clang" || {
+            echo "ERROR: clang-r510928 missing from the tree"
+            ls -d "$PWD"/prebuilts/clang/host/linux-x86/clang-* 2>/dev/null || true
+            exit 1
+          }
+          export PATH="/usr/lib/ccache:$PATH"
+          for tb in prebuilts/build-tools/path/linux-x86 prebuilts/kernel-build-tools/path/linux-x86; do
+            [ -d "$PWD/$tb" ] && export PATH="$PWD/$tb:$PATH"
+          done
+          export PATH="$CLANG_DIR/bin:$PATH"
+          echo "--- toolchain in use ---"
+          which clang
+          which ld.lld
+          clang --version | head -3
+          ld.lld --version | head -1
+          # must be the exact llvm-project commit the stock kernel carries
+          clang --version | head -1 | grep -q '477610d4d0d988e69dbc3fae4fe86bff3f07f2b5' || {
+            echo "ERROR: clang is not the stock llvm-project commit (477610d4...)"
+            clang --version | head -1
+            exit 1
+          }
+          case "$(which clang)" in
+            "$CLANG_DIR"/*) echo "clang resolves inside clang-r510928: OK" ;;
+            *) echo "ERROR: clang is $(which clang), expected under $CLANG_DIR"
+               exit 1 ;;
+          esac
+
+          # Identity must be byte-identical to the stock image: pin the whole tuple.
+          export KBUILD_BUILD_USER=kleaf
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_VERSION=1
+          export SOURCE_DATE_EPOCH=$(date -u -d "2026-04-08 15:08:30" +%s)
+          export KBUILD_BUILD_TIMESTAMP="Wed Apr  8 15:08:30 UTC 2026"
+
+
+          PLAT="$PWD"
+          RUSTC="$PLAT/prebuilts/rust/linux-x86/1.73.0b/bin/rustc"
+          PAHOLE="$PLAT/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
+          [ -x "$RUSTC" ] || RUSTC=""
+          [ -x "$PAHOLE" ] || PAHOLE="$(command -v pahole || true)"
+
+          cd "$PLAT/common"
+          echo "=== building common (the GKI tree) ==="
+          # Build exactly like the reference flow. KCFLAGS is quoted so the shell does
+          # not try to interpret the "+=" the way it would for an exported variable.
+          set +e
+          make -j"$(nproc --all)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld \
+            ${RUSTC:+RUSTC="$RUSTC"} ${PAHOLE:+PAHOLE="$PAHOLE"} \
+            O=out "KCFLAGS+=-O2" gki_defconfig all 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "make exit=$rc"
+          if [ "$rc" != "0" ]; then
+            echo "--- errors ---"
+            grep -E "error:|Error [0-9]" /tmp/build.log | head -30
+            exit 1
+          fi
+          IMG=out/arch/arm64/boot/Image
+          test -s "$IMG" || { echo "ERROR: Image not produced"; ls -la out/arch/arm64/boot/ 2>/dev/null; exit 1; }
+          echo "Image: $IMG ($(stat -c%s "$IMG") bytes)"
+          echo "--- release string ---"
+          BANNER=$(strings -n 12 "$IMG" | grep -m1 '^Linux version ')
+          echo "$BANNER"
+          # The banner must be byte-identical to the stock image. Identity drift
+          # here is exactly the class of bug that made earlier builds unshippable.
+          STOCK_BANNER='Linux version 6.6.118-android15-8-g93e223c276e7-abogki500782043-4k (kleaf@build-host) (Android (11368308, +pgo, +bolt, +lto, +mlgo, based on r510928) clang version 18.0.0 (https://android.googlesource.com/toolchain/llvm-project 477610d4d0d988e69dbc3fae4fe86bff3f07f2b5), LLD 18.0.0) #1 SMP PREEMPT Wed Apr  8 15:08:30 UTC 2026'
+          if [ "$BANNER" = "$STOCK_BANNER" ]; then
+            echo "IDENTITY OK: banner is byte-identical to stock"
+          else
+            echo "ERROR: banner differs from stock"
+            echo "  got     : $BANNER"
+            echo "  expected: $STOCK_BANNER"
+            exit 1
+          fi
+
+      - name: verify_gki_config
+        if: ${{ !inputs.DRY_RUN }}
+        run: |
+          CFG=workspace/kernel_platform/common/out/.config
+          test -s "$CFG" || { echo "ERROR: .config missing"; exit 1; }
+          KR=$(strings -n 12 workspace/kernel_platform/common/out/arch/arm64/boot/Image | grep -m1 '^Linux version ')
+          echo "banner: $KR"
+          RELTOK=$(echo "$KR" | sed -n 's/^Linux version \([^ ]*\).*/\1/p')
+          echo "release token: $RELTOK"
+
+          # common/Makefile has EXTRAVERSION empty, so "-android15-8-..." must come from
+          # CONFIG_LOCALVERSION. Compare against the full expected string, built from the
+          # version numbers and the requested suffix, so a missing -android15-8 fails here
+          # instead of silently producing a kirin of wrong vermagic.
+          EXPECTED="6.6.118${{ inputs.KERNEL_LOCALVERSION }}"
+          echo "expected     : $EXPECTED"
+          if [ "$RELTOK" != "$EXPECTED" ]; then
+            echo "ERROR: release token does not match the stock string"
+            echo "  got      : $RELTOK"
+            echo "  expected : $EXPECTED"
+            echo "--- CONFIG_LOCALVERSION actually used ---"
+            grep -n '^CONFIG_LOCALVERSION' "$CFG" || echo "  (no CONFIG_LOCALVERSION in .config)"
+            echo "--- Makefile EXTRAVERSION ---"
+            grep -n '^EXTRAVERSION' workspace/kernel_platform/common/Makefile || true
+            exit 1
+          fi
+          case "$RELTOK" in
+            *+) echo "ERROR: dangling '+' in release token"; exit 1 ;;
+          esac
+          echo "release string ok (exact match)"
+
+          echo "--- required symbols ---"
+          grep -qE "^CONFIG_KSU=y"        "$CFG" || { echo "ERROR: CONFIG_KSU missing"; exit 1; }
+          if [ "${{ inputs.ENABLE_KPM }}" = "true" ]; then
+            grep -qE "^CONFIG_KPM=y"      "$CFG" || { echo "ERROR: CONFIG_KPM missing"; exit 1; }
+          fi
+          if [ "${{ inputs.ENABLE_SUSFS }}" = "true" ]; then
+            grep -qE "^CONFIG_KSU_SUSFS=y" "$CFG" || { echo "ERROR: CONFIG_KSU_SUSFS missing"; exit 1; }
+          fi
+          grep -qE "^CONFIG_ARM64_4K_PAGES=y" "$CFG" || { echo "ERROR: not 4K pages"; exit 1; }
+          echo "--- forbiddden vendor symbols (must be absent from a GKI kernel) ---"
+          for s in CONFIG_ARCH_SUN CONFIG_ARM_SMMU CONFIG_COMMON_CLK_QCOM; do
+            if grep -qE "^$s=[ym]" "$CFG"; then echo "ERROR: $s enabled"; exit 1; fi
+          done
+          MODS=$(grep -cE '^CONFIG_[A-Za-z0-9_]+=m$' "$CFG" || true)
+          echo "module count: $MODS"
+          test "$MODS" -lt 150 || { echo "ERROR: $MODS modules, vendor fragment leaked"; exit 1; }
+          echo "gki config verify ok"
+
+      - name: kernel_patch
+        if: ${{ !inputs.DRY_RUN && inputs.ENABLE_KERNEL_PATCH == true }}
+        run: |
+          # SukiSU's KernelPatch binary pass injects the hook table the manager talks to.
+          # It reads ./Image and writes ./oImage in the current directory.
+          cd workspace/kernel_platform/common/out/arch/arm64/boot
+          test -s Image || { echo "ERROR: Image missing before patching"; exit 1; }
+          cp -f Image Image.pre_patch
+          rm -f oImage patch_linux
+          curl -fL -o patch_linux \
+            https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux \
+            || { echo "ERROR: could not download patch_linux"; exit 1; }
+          chmod +x patch_linux
+          ls -la patch_linux
+          set +e
+          ./patch_linux 2>&1 | tail -40
+          prc=${PIPESTATUS[0]}
+          set -e
+          echo "patch_linux exit=$prc"
+          if [ -s oImage ]; then
+            echo "oImage produced ($(stat -c%s oImage) bytes)"
+            mv -f oImage Image
+            echo "swapped in the patched kernel"
+            rm -f Image.pre_patch
+          else
+            echo "WARN: patch_linux produced no usable oImage; keeping the unpatched Image"
+            mv -f Image.pre_patch Image
+          fi
+          ls -la Image*
+          echo "--- release string after patching ---"
+          strings -n 12 Image | grep -m1 '^Linux version ' || true
+          echo "--- ksu symbols present? ---"
+          if strings -n 6 Image | grep -q '^ksu_'; then
+            echo "  ksu symbols found in the image"
+          else
+            echo "  WARN: no ksu_ strings visible (they may be in the symbol table only)"
+          fi
+
+      - name: package_ak3
+        if: ${{ !inputs.DRY_RUN }}
+        run: |
+          cd workspace/kernel_platform/common/out/arch/arm64/boot
+          test -s Image || { echo "ERROR: Image missing"; exit 1; }
+          cd "$GITHUB_WORKSPACE"
+          rm -rf /tmp/ak3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/ak3
+          cp workspace/kernel_platform/common/out/arch/arm64/boot/Image /tmp/ak3/Image
+          AK=/tmp/ak3/anykernel.sh
+          test -f "$AK" || { echo "ERROR: anykernel.sh missing"; exit 1; }
+
+          # device + slot wiring for PKR110 (A/B, boot holds no ramdisk)
+          sed -i -E 's|^[[:space:]]*BLOCK=.*|BLOCK=/dev/block/bootdevice/by-name/boot;|' "$AK"
+          sed -i -E 's|^[[:space:]]*IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=1;|' "$AK"
+          sed -i 's|^device\.name1=.*|device.name1=sun|' "$AK"
+          sed -i 's|^device\.name2=.*|device.name2=PKR110|' "$AK"
+          sed -i 's|^device\.name3=.*|device.name3=OP60EBL1|' "$AK"
+          sed -i 's|^device\.name4=.*|device.name4=|' "$AK"
+          sed -i 's|^device\.name5=.*|device.name5=|' "$AK"
+          sed -i "s|^kernel\.string=.*|kernel.string=Ace5Pro PKR110 6.6.118 SukiSU+SUSFS+KPM (${SHORT_SHA})|" "$AK"
+
+          # boot has no ramdisk: split_boot + flash_boot instead of dump/write
+          sed -i -E 's|^[[:space:]]*dump_boot;.*$|split_boot; # no ramdisk on boot|' "$AK"
+          sed -i -E 's|^[[:space:]]*write_boot;.*$|flash_boot; # write kernel back|' "$AK"
+          # fallback if the template spelled the calls differently: the AnyKernel3
+          # template marks its boot section with "# boot install" / "## end boot install"
+          if ! grep -qE '^[[:space:]]*split_boot;' "$AK"; then
+            if grep -q '^# boot install' "$AK"; then
+              sed -i '/^# boot install/a split_boot;' "$AK"
+            elif grep -q '^# import functions' "$AK"; then
+              sed -i '/^# import functions/i split_boot;' "$AK"
+            fi
+          fi
+          if ! grep -qE '^[[:space:]]*flash_boot;' "$AK"; then
+            if grep -q '^## end boot install' "$AK"; then
+              sed -i '/^## end boot install/i flash_boot;' "$AK"
+            fi
+          fi
+          if ! grep -qE '^[[:space:]]*split_boot;' "$AK"; then
+            echo "ERROR: could not activate split_boot in anykernel.sh"
+            sed -n '1,70p' "$AK"
+            exit 1
+          fi
+          if ! grep -qE '^[[:space:]]*flash_boot;' "$AK"; then
+            echo "ERROR: could not activate flash_boot in anykernel.sh"
+            sed -n '1,70p' "$AK"
+            exit 1
+          fi
+          # the template ships Galaxy Nexus (tuna) tweaks that would corrupt the ramdisk
+          for pat in 'backup_file init\.rc;' 'replace_string init\.rc' 'backup_file init\.tuna\.rc;' \
+                     'insert_line init\.tuna\.rc' 'append_file init\.tuna\.rc' \
+                     'backup_file fstab\.tuna;' 'patch_fstab fstab\.tuna' 'append_file fstab\.tuna'; do
+            sed -i -E "s|^([[:space:]]*)($pat)|#\1\2|" "$AK"
+          done
+
+          echo "--- anykernel.sh key lines ---"
+          grep -nE 'IS_SLOT_DEVICE|^BLOCK=|device\.name[1-5]|kernel\.string' "$AK" | head -12
+          if grep -qE '^[[:space:]]*(dump_boot|write_boot);' "$AK"; then
+            echo "ERROR: dump_boot/write_boot still active"; exit 1
+          fi
+          echo "boot section:"
+          sed -n '/# boot install/,/## end boot install/p' "$AK" | head -25
+
+          mkdir -p /tmp/artifact
+          ZIP="AnyKernel3-ace5pro-sun-6.6.118-SukiSU-SUSFS-KPM-${SHORT_SHA}.zip"
+          cd /tmp/ak3
+          zip -r9 "/tmp/artifact/$ZIP" . -x '.git/*' '**/.git/*' '*.zip' '**/*.zip' \
+            || { echo "ERROR: zip failed"; exit 1; }
+          unzip -l "/tmp/artifact/$ZIP" | grep -q 'Image' || { echo "ERROR: Image not in zip"; exit 1; }
+          unzip -l "/tmp/artifact/$ZIP" | grep -q 'anykernel.sh' || { echo "ERROR: anykernel.sh not in zip"; exit 1; }
+          echo "ak3 packaged: $ZIP"
+
+      - name: build_boot_img
+        if: ${{ !inputs.DRY_RUN }}
+        run: |
+          # Wrap the kernel in a stock-shaped Android boot header v4 so it can also be
+          # flashed with `fastboot flash boot` without AK3 running on the device.
+          IMG=workspace/kernel_platform/common/out/arch/arm64/boot/Image
+          test -s "$IMG" || { echo "ERROR: Image missing"; exit 1; }
+          KSIZE=$(stat -c%s "$IMG")
+          MAGIC=$(od -An -tx1 -j56 -N4 "$IMG" | tr -d ' \n')
+          echo "kernel: $IMG ($KSIZE bytes) magic@0x38=$MAGIC"
+          [ "$MAGIC" = "41524d64" ] || { echo "ERROR: not a raw arm64 Image"; exit 1; }
+
+          mkdir -p /tmp/artifact
+          BOOTIMG=/tmp/artifact/boot_ace5pro_sun_sukisu_susfs_kpm.img
+          HDR=/tmp/boot_hdr.bin
+          rm -f "$HDR" "$BOOTIMG"
+          dd if=/dev/zero of="$HDR" bs=1 count=1584 status=none
+          printf 'ANDROID!' | dd of="$HDR" bs=1 seek=0 conv=notrunc status=none
+
+          echo_u32le() {
+            v=$1; o=$2; fl=$3
+            b0=$(( v         & 255 )); b1=$(( (v >>  8) & 255 ))
+            b2=$(( (v >> 16) & 255 )); b3=$(( (v >> 24) & 255 ))
+            o0=$(printf '%03o' "$b0"); o1=$(printf '%03o' "$b1")
+            o2=$(printf '%03o' "$b2"); o3=$(printf '%03o' "$b3")
+            printf "\\$o0\\$o1\\$o2\\$o3" | dd of="$fl" bs=1 seek="$o" conv=notrunc status=none
+          }
+          echo_u32le "$KSIZE" 8  "$HDR"
+          echo_u32le 0       12  "$HDR"
+          echo_u32le 0       16  "$HDR"
+          echo_u32le 1584    20  "$HDR"
+          echo_u32le 4       40  "$HDR"
+          echo_u32le 0       1580 "$HDR"
+
+          dd if=/dev/zero of=/tmp/boot_pad.bin bs=1 count=2512 status=none
+          cat "$HDR" /tmp/boot_pad.bin "$IMG" > "$BOOTIMG"
+
+          SZ=$(stat -c%s "$BOOTIMG")
+          echo "--- boot.img check ---"
+          echo "  size          : $SZ (expected $((4096 + KSIZE)))"
+          [ "$SZ" = "$((4096 + KSIZE))" ] || { echo "ERROR: size mismatch"; exit 1; }
+          read_ks=$(od -An -tu4 -j8    -N4 "$BOOTIMG" | tr -d ' ')
+          read_hs=$(od -An -tu4 -j20   -N4 "$BOOTIMG" | tr -d ' ')
+          read_hv=$(od -An -tu4 -j40   -N4 "$BOOTIMG" | tr -d ' ')
+          read_sig=$(od -An -tu4 -j1580 -N4 "$BOOTIMG" | tr -d ' ')
+          echo "  kernel_size   : $read_ks"
+          echo "  header_size   : $read_hs"
+          echo "  header_version: $read_hv"
+          echo "  signature_size: $read_sig"
+          [ "$read_ks" = "$KSIZE" ] || { echo "ERROR: kernel_size wrong"; exit 1; }
+          [ "$read_hs" = "1584" ]   || { echo "ERROR: header_size wrong"; exit 1; }
+          [ "$read_hv" = "4" ]      || { echo "ERROR: header_version wrong"; exit 1; }
+          [ "$read_sig" = "0" ]     || { echo "ERROR: signature_size wrong"; exit 1; }
+          kmagic=$(od -An -tx1 -j$((4096 + 56)) -N4 "$BOOTIMG" | tr -d ' \n')
+          [ "$kmagic" = "41524d64" ] || { echo "ERROR: kernel payload magic wrong"; exit 1; }
+          REL=$(strings -n 12 "$BOOTIMG" | grep -m1 '^Linux version ')
+          echo "  release       : ${REL:-(not found)}"
+          [ -n "$REL" ] || { echo "ERROR: no banner"; exit 1; }
+          echo "boot.img ok"
+          ls -l /tmp/artifact
+
+      - name: upload_artifact
+        if: ${{ !inputs.DRY_RUN }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ace5pro-sun-6.6.118-SukiSU-SUSFS-KPM-${{ env.SHORT_SHA }}
+          path: |
+            /tmp/artifact/*.zip
+            /tmp/artifact/*.img
+          if-no-files-found: error
+
+      - name: upload_build_metadata
+        if: ${{ !inputs.DRY_RUN }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-${{ env.SHORT_SHA }}
+          path: |
+            workspace/kernel_platform/common/out/.config
+            workspace/kernel_platform/common/out/Module.symvers
+          if-no-files-found: warn
